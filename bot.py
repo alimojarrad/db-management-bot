@@ -155,7 +155,8 @@ The user asked:
 The database returned:
 {data}
 
-Summarize the answer in a friendly and concise way.
+Summarize the answer in a friendly and concise way. Report the output in a clean Markdown format, appliable in Telegram.
+If there's a list order it by number not dash or ident.
 Do not mention SQL or database implementation details.
 """
 
@@ -202,7 +203,7 @@ def start(message):
     bot.send_message(
         message.chat.id,
         "👋 Hello! I am your database agent.\n\n"
-        "Tell me what you want to read or update using plain English."
+        "Tell me what you want to read or update using plain English.",
     )
 
 
@@ -223,7 +224,7 @@ def handle_user_message(message):
 
     status_msg = bot.send_message(
         chat_id,
-        "🧠 Analyzing request..."
+        "🧠 Analyzing request...",
     )
 
     try:
@@ -293,11 +294,19 @@ def handle_user_message(message):
                 user_history[chat_id] = user_history[chat_id][-MAX_HISTORY_LENGTH:]
                 save_history(user_history)
 
-                bot.edit_message_text(
+                try:
+                    bot.edit_message_text(
                     friendly_summary,
                     chat_id,
-                    status_msg.message_id
+                    status_msg.message_id,
+                    parse_mode="Markdown"
                 )
+                except Exception:
+                    bot.edit_message_text(
+                        friendly_summary,
+                        chat_id,
+                        status_msg.message_id,
+                    )
             else:
                 bot.edit_message_text(
                     f"⚠️ Database Error:\n\n{result}",
@@ -376,7 +385,8 @@ def handle_button_callback(call):
         bot.edit_message_text(
             "❌ This action has expired or has already been processed.",
             chat_id,
-            call.message.message_id
+            call.message.message_id,
+            "Markdown"
         )
         return
 
@@ -393,7 +403,7 @@ def handle_button_callback(call):
             bot.edit_message_text(
                 "✅ Action completed successfully.",
                 chat_id,
-                call.message.message_id
+                call.message.message_id,
             )
             
             if chat_id not in user_history:
