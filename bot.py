@@ -19,7 +19,7 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
+MODEL = os.getenv("model")
 # Parse multiple admin IDs from a comma-separated string
 admin_ids_raw = os.getenv("ADMIN_CHAT_IDS", " ")
 
@@ -107,7 +107,7 @@ class AgentSQLResponse(BaseModel):
 def check_message_relevance(user_request: str) -> bool:
     prompt = f"Analyze if this message is relevant to a database bot or system admin. Ignore casual chat.\nMessage: {user_request}"
     response = client.models.generate_content(
-        model="gemini-3-flash-preview", 
+        model=MODEL, 
         contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=RelevanceCheckResponse, temperature=0.1),
     )
@@ -129,7 +129,7 @@ Rules:
 User Request: {user_request}
 """
     response = client.models.generate_content(
-        model="gemini-3-flash-preview", 
+        model=MODEL, 
         contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=AgentSQLResponse, temperature=0.1),
     )
@@ -137,7 +137,7 @@ User Request: {user_request}
 
 def summarize_data_with_gemini(data: list, user_request: str, history: str) -> str:
     prompt = f"Recent History: {history}\nUser asked: {user_request}\nDB returned: {data}\nSummarize friendly in Markdown. Do not mention SQL implementation."
-    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    response = client.models.generate_content(model=MODEL, contents=prompt)
     return response.text
 
 # ==========================================
