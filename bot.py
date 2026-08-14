@@ -22,10 +22,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # Azure VM MySQL configuration
 DB_CONFIG = {
     "host": os.getenv("host"),
-    "port": "3306",
-    "user": "project",
+    "port": os.getenv("port"),
+    "user": os.getenv("user"),
     "password": os.getenv("password"),
-    "database": "my_database"
+    "database": os.getenv("database")
 }
 
 # ==========================================
