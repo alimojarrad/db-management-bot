@@ -18,11 +18,12 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 
 # Azure VM MySQL configuration
 DB_CONFIG = {
     "host": os.getenv("host"),
-    "port": os.getenv("port"),
+    "port": os.getenv("port", "3306"),
     "user": os.getenv("user"),
     "password": os.getenv("password"),
     "database": os.getenv("database")
@@ -50,32 +51,36 @@ Table: orders (
 """
 
 # ==========================================
-# 3. HISTORY FILE & CACHE LOGIC
+# 3. PERSISTENT STORAGE & CACHE LOGIC
 # ==========================================
 
 HISTORY_FILE = "user_history.json"
-MAX_HISTORY_LENGTH = 10  # Keeps the last 10 messages (5 user requests + 5 agent replies)
+GOVERNANCE_FILE = "governance.json"
+USERS_FILE = "users.json"
+MAX_HISTORY_LENGTH = 10  # Keeps last 10 messages (5 turns)
 
-def load_history():
-    """Loads history from the JSON file into memory."""
-    if not os.path.exists(HISTORY_FILE):
+def load_json(filepath):
+    if not os.path.exists(filepath):
         return {}
-    
-    with open(HISTORY_FILE, "r", encoding="utf-8") as file:
+    with open(filepath, "r", encoding="utf-8") as file:
         try:
             data = json.load(file)
-            # JSON keys are strings, convert chat_id back to integers for Telegram
             return {int(k): v for k, v in data.items()}
         except json.JSONDecodeError:
             return {}
 
-def save_history(history_dict):
-    """Saves the memory dictionary back to the JSON file."""
-    with open(HISTORY_FILE, "w", encoding="utf-8") as file:
-        json.dump(history_dict, file, indent=4)
+def save_json(filepath, data_dict):
+    with open(filepath, "w", encoding="utf-8") as file:
+        json.dump(data_dict, file, indent=4)
 
-# Load existing history when script starts
-user_history = load_history()
+# Initialize data from files
+user_history = load_json(HISTORY_FILE)
+governance_state = load_json(GOVERNANCE_FILE)
+users_db = load_json(USERS_FILE)
+
+# Temporary in-memory registration buffer
+registration_data = {}
+pending_queries = {}
 
 # ==========================================
 # 4. INITIALIZE CLIENTS
@@ -83,10 +88,6 @@ user_history = load_history()
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 client = genai.Client(api_key=GEMINI_API_KEY)
-
-# In-memory store for pending writes (No need to save this to JSON)
-pending_queries = {}
-
 
 # ==========================================
 # 5. GEMINI SCHEMAS & API CALLS
@@ -105,7 +106,6 @@ class AgentSQLResponse(BaseModel):
             "what this query will change or read. Use plain English."
         )
     )
-
 
 def get_sql_from_gemini(user_request: str, history: str) -> AgentSQLResponse:
     prompt = f"""
@@ -143,7 +143,6 @@ User Request:
     )
     return response.parsed
 
-
 def summarize_data_with_gemini(data: list, user_request: str, history: str) -> str:
     prompt = f"""
 Recent Chat History:
@@ -155,8 +154,8 @@ The user asked:
 The database returned:
 {data}
 
-Summarize the answer in a friendly and concise way. Report the output in a clean Markdown format, appliable in Telegram.
-If there's a list order it by number not dash or ident.
+Summarize the answer in a friendly and concise way. Report the output in a clean Markdown format, applicable in Telegram.
+If there's a list order it by number not dash or indent.
 Do not mention SQL or database implementation details.
 """
 
@@ -165,7 +164,6 @@ Do not mention SQL or database implementation details.
         contents=prompt
     )
     return response.text
-
 
 # ==========================================
 # 6. DATABASE EXECUTION
@@ -193,22 +191,138 @@ def execute_query(sql: str, fetch_results: bool = False):
         if connection and connection.is_connected():
             connection.close()
 
-
 # ==========================================
-# 7. /START COMMAND
+# 7. ONBOARDING & /START COMMAND
 # ==========================================
 
 @bot.message_handler(commands=["start"])
 def start(message):
+    chat_id = message.chat.id
+    user = users_db.get(chat_id)
+
+    # 1. Registered and Approved
+    if user and user.get("role") in ["admin", "viewer"]:
+        markup = telebot_types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+        btn1 = telebot_types.KeyboardButton("List customers")
+        btn2 = telebot_types.KeyboardButton("List orders")
+        btn3 = telebot_types.KeyboardButton("Show today's income")
+        btn4 = telebot_types.KeyboardButton("Count total orders")
+        markup.add(btn1, btn2, btn3, btn4)
+
+        bot.send_message(
+            chat_id,
+            f"👋 Welcome back, {user['name']}! (Role: **{user['role'].upper()}**)\n\n"
+            "Tell me what you want to read or update using plain English, or use the quick menu below.",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+    # 2. Pending Approval
+    elif user and user.get("role") == "pending":
+        bot.send_message(
+            chat_id,
+            "⏳ Your access request is currently pending review by the administrator."
+        )
+    # 3. New User: Start Onboarding Form
+    else:
+        msg = bot.send_message(
+            chat_id,
+            "👋 Welcome to the Database Agent!\n\n"
+            "You are not authorized yet. Please fill out this short form to request access.\n\n"
+            "👤 *What is your full name?*",
+            parse_mode="Markdown",
+            reply_markup=telebot_types.ReplyKeyboardRemove()
+        )
+        bot.register_next_step_handler(msg, process_name_step)
+
+def process_name_step(message):
+    chat_id = message.chat.id
+    registration_data[chat_id] = {"name": message.text.strip()}
+    msg = bot.send_message(chat_id, "📞 *What is your phone number?*", parse_mode="Markdown")
+    bot.register_next_step_handler(msg, process_phone_step)
+
+def process_phone_step(message):
+    chat_id = message.chat.id
+    registration_data[chat_id]["phone"] = message.text.strip()
+    msg = bot.send_message(chat_id, "🎭 *Which role are you requesting?* (Type `Viewer` or `Admin`)", parse_mode="Markdown")
+    bot.register_next_step_handler(msg, process_role_step)
+
+def process_role_step(message):
+    chat_id = message.chat.id
+    registration_data[chat_id]["wanted_role"] = message.text.strip()
+    msg = bot.send_message(chat_id, "📝 *Briefly describe why you need access to this database:*", parse_mode="Markdown")
+    bot.register_next_step_handler(msg, process_desc_step)
+
+def process_desc_step(message):
+    chat_id = message.chat.id
+    registration_data[chat_id]["desc"] = message.text.strip()
+
+    # Save to user database with pending status
+    users_db[chat_id] = {
+        "name": registration_data[chat_id]["name"],
+        "phone": registration_data[chat_id]["phone"],
+        "wanted_role": registration_data[chat_id]["wanted_role"],
+        "desc": registration_data[chat_id]["desc"],
+        "role": "pending"
+    }
+    save_json(USERS_FILE, users_db)
+
     bot.send_message(
-        message.chat.id,
-        "👋 Hello! I am your database agent.\n\n"
-        "Tell me what you want to read or update using plain English.",
+        chat_id,
+        "✅ *Your request has been submitted!*\nThe administrator has been notified and will review your application.",
+        parse_mode="Markdown"
     )
 
+    # Forward request to Admin
+    if ADMIN_CHAT_ID:
+        keyboard = telebot_types.InlineKeyboardMarkup()
+        keyboard.row(
+            telebot_types.InlineKeyboardButton("✅ Approve as ADMIN", callback_data=f"auth_admin_{chat_id}"),
+            telebot_types.InlineKeyboardButton("👀 Approve as VIEWER", callback_data=f"auth_viewer_{chat_id}")
+        )
+        keyboard.row(
+            telebot_types.InlineKeyboardButton("❌ Reject", callback_data=f"auth_reject_{chat_id}")
+        )
+
+        admin_msg = (
+            f"🚨 **New Database Access Request**\n\n"
+            f"👤 **Name:** {users_db[chat_id]['name']}\n"
+            f"📞 **Phone:** {users_db[chat_id]['phone']}\n"
+            f"🎭 **Requested Role:** {users_db[chat_id]['wanted_role']}\n"
+            f"📝 **Reason:** {users_db[chat_id]['desc']}\n\n"
+            f"Choose an action:"
+        )
+        bot.send_message(int(ADMIN_CHAT_ID), admin_msg, parse_mode="Markdown", reply_markup=keyboard)
 
 # ==========================================
-# 8. USER MESSAGE HANDLER
+# 8. /SETTINGS COMMAND (Governance Toggle)
+# ==========================================
+
+@bot.message_handler(commands=["settings"])
+def settings_menu(message):
+    chat_id = message.chat.id
+    user = users_db.get(chat_id)
+    if not user or user.get("role") != "admin":
+        bot.send_message(chat_id, "❌ Only administrators can adjust governance settings.")
+        return
+
+    is_enabled = governance_state.get(chat_id, True)
+    status_text = "🟢 ENABLED" if is_enabled else "🔴 DISABLED"
+    btn_text = "Disable Governance 🔴" if is_enabled else "Enable Governance 🟢"
+
+    keyboard = telebot_types.InlineKeyboardMarkup()
+    keyboard.add(telebot_types.InlineKeyboardButton(btn_text, callback_data="toggle_gov"))
+
+    bot.send_message(
+        chat_id,
+        f"🛡 **Governance Settings**\n\n"
+        f"Deterministic security checks block destructive statements (`DROP`, `TRUNCATE`, `ALTER`, unbounded `UPDATE`/`DELETE`).\n\n"
+        f"Current Status: **{status_text}**",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+# ==========================================
+# 9. USER MESSAGE HANDLER (RBAC Enforced)
 # ==========================================
 
 @bot.message_handler(func=lambda message: True, content_types=["text"])
@@ -216,54 +330,68 @@ def handle_user_message(message):
     user_text = message.text
     chat_id = message.chat.id
 
+    # 1. Check Authorization
+    user = users_db.get(chat_id)
+    if not user or user.get("role") not in ["admin", "viewer"]:
+        bot.send_message(chat_id, "❌ You are not authorized to use this bot. Type /start to request access.")
+        return
+
+    user_role = user["role"]
+
     if chat_id not in user_history:
         user_history[chat_id] = []
 
-    # Get history for context mapping
     history_string = "\n".join(user_history[chat_id])
 
-    status_msg = bot.send_message(
-        chat_id,
-        "🧠 Analyzing request...",
-    )
+    status_msg = bot.send_message(chat_id, "🧠 Analyzing request...")
 
     try:
         agent_response = get_sql_from_gemini(user_text, history_string)
         sql = agent_response.sql.strip()
         sql_upper = sql.upper()
 
-        # ----------------------------------
-        # SECURITY / GOVERNANCE
-        # ----------------------------------
-        forbidden_keywords = ["DROP", "TRUNCATE", "ALTER", "GRANT"]
-
-        if any(keyword in sql_upper for keyword in forbidden_keywords):
+        # 2. RBAC Write Guard
+        if agent_response.intent == "WRITE" and user_role != "admin":
             bot.edit_message_text(
-                "❌ Security Alert:\n\nDestructive schema queries are blocked.",
+                "❌ **Access Denied:** Your role (`VIEWER`) does not have permission to modify the database.",
                 chat_id,
-                status_msg.message_id
+                status_msg.message_id,
+                parse_mode="Markdown"
             )
             return
 
-        if ";" in sql.rstrip(";"):
-            bot.edit_message_text(
-                "❌ Security Alert:\n\nMultiple SQL statements are not allowed.",
-                chat_id,
-                status_msg.message_id
-            )
-            return
+        # 3. Optional Deterministic Governance
+        is_gov_enabled = governance_state.get(chat_id, True)
+        if is_gov_enabled:
+            forbidden_keywords = ["DROP", "TRUNCATE", "ALTER", "GRANT"]
 
-        if (
-            agent_response.intent == "WRITE"
-            and (sql_upper.startswith("UPDATE") or sql_upper.startswith("DELETE"))
-            and "WHERE" not in sql_upper
-        ):
-            bot.edit_message_text(
-                "❌ Security Alert:\n\nUPDATE/DELETE without a WHERE clause is blocked.",
-                chat_id,
-                status_msg.message_id
-            )
-            return
+            if any(keyword in sql_upper for keyword in forbidden_keywords):
+                bot.edit_message_text(
+                    "❌ Security Alert:\n\nDestructive schema queries are blocked.",
+                    chat_id,
+                    status_msg.message_id
+                )
+                return
+
+            if ";" in sql.rstrip(";"):
+                bot.edit_message_text(
+                    "❌ Security Alert:\n\nMultiple SQL statements are not allowed.",
+                    chat_id,
+                    status_msg.message_id
+                )
+                return
+
+            if (
+                agent_response.intent == "WRITE"
+                and (sql_upper.startswith("UPDATE") or sql_upper.startswith("DELETE"))
+                and "WHERE" not in sql_upper
+            ):
+                bot.edit_message_text(
+                    "❌ Security Alert:\n\nUPDATE/DELETE without a WHERE clause is blocked.",
+                    chat_id,
+                    status_msg.message_id
+                )
+                return
 
         # ----------------------------------
         # READ
@@ -288,24 +416,24 @@ def handle_user_message(message):
 
                 friendly_summary = summarize_data_with_gemini(result, user_text, history_string)
 
-                # LRU CACHE LOGIC: Append -> Slice to max length -> Save
+                # LRU Cache memory
                 user_history[chat_id].append(f"User: {user_text}")
                 user_history[chat_id].append(f"Agent: {friendly_summary}")
                 user_history[chat_id] = user_history[chat_id][-MAX_HISTORY_LENGTH:]
-                save_history(user_history)
+                save_json(HISTORY_FILE, user_history)
 
                 try:
-                    bot.edit_message_text(
-                    friendly_summary,
-                    chat_id,
-                    status_msg.message_id,
-                    parse_mode="Markdown"
-                )
-                except Exception:
                     bot.edit_message_text(
                         friendly_summary,
                         chat_id,
                         status_msg.message_id,
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    bot.edit_message_text(
+                        friendly_summary,
+                        chat_id,
+                        status_msg.message_id
                     )
             else:
                 bot.edit_message_text(
@@ -359,18 +487,97 @@ def handle_user_message(message):
             status_msg.message_id
         )
 
-
 # ==========================================
-# 9. CALLBACK BUTTON HANDLER
+# 10. CALLBACK BUTTON HANDLER
 # ==========================================
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_button_callback(call):
     bot.answer_callback_query(call.id)
     chat_id = call.message.chat.id
+    data = call.data
 
+    # ----------------------------------
+    # 1. GOVERNANCE TOGGLE
+    # ----------------------------------
+    if data == "toggle_gov":
+        current_state = governance_state.get(chat_id, True)
+        new_state = not current_state
+        governance_state[chat_id] = new_state
+        save_json(GOVERNANCE_FILE, governance_state)
+
+        status_text = "🟢 ENABLED" if new_state else "🔴 DISABLED"
+        btn_text = "Disable Governance 🔴" if new_state else "Enable Governance 🟢"
+
+        keyboard = telebot_types.InlineKeyboardMarkup()
+        keyboard.add(telebot_types.InlineKeyboardButton(btn_text, callback_data="toggle_gov"))
+
+        bot.edit_message_text(
+            f"🛡 **Governance Settings**\n\n"
+            f"Deterministic security checks block destructive statements (`DROP`, `TRUNCATE`, `ALTER`, unbounded `UPDATE`/`DELETE`).\n\n"
+            f"Current Status: **{status_text}**",
+            chat_id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+        return
+
+    # ----------------------------------
+    # 2. ADMIN USER AUTHORIZATION
+    # ----------------------------------
+    if data.startswith("auth_"):
+        parts = data.split("_")
+        action = parts[1]
+        target_user_id = int(parts[2])
+
+        if action == "admin":
+            users_db[target_user_id]["role"] = "admin"
+            bot.edit_message_text(
+                f"✅ Approved user `{target_user_id}` as **ADMIN**.",
+                chat_id,
+                call.message.message_id,
+                parse_mode="Markdown"
+            )
+            bot.send_message(
+                target_user_id,
+                "🎉 Your access request has been approved! You have been granted **ADMIN** access.\nType /start to load your menu.",
+                parse_mode="Markdown"
+            )
+        elif action == "viewer":
+            users_db[target_user_id]["role"] = "viewer"
+            bot.edit_message_text(
+                f"✅ Approved user `{target_user_id}` as **VIEWER**.",
+                chat_id,
+                call.message.message_id,
+                parse_mode="Markdown"
+            )
+            bot.send_message(
+                target_user_id,
+                "🎉 Your access request has been approved! You have been granted **VIEWER** access.\nType /start to load your menu.",
+                parse_mode="Markdown"
+            )
+        elif action == "reject":
+            users_db.pop(target_user_id, None)
+            bot.edit_message_text(
+                f"❌ Rejected access for user `{target_user_id}`.",
+                chat_id,
+                call.message.message_id,
+                parse_mode="Markdown"
+            )
+            bot.send_message(
+                target_user_id,
+                "❌ Your access request was declined by the administrator."
+            )
+
+        save_json(USERS_FILE, users_db)
+        return
+
+    # ----------------------------------
+    # 3. SQL WRITE APPROVAL / REJECTION
+    # ----------------------------------
     try:
-        action, query_id = call.data.split("_", 1)
+        action, query_id = data.split("_", 1)
     except ValueError:
         bot.edit_message_text(
             "❌ Invalid callback.",
@@ -385,17 +592,13 @@ def handle_button_callback(call):
         bot.edit_message_text(
             "❌ This action has expired or has already been processed.",
             chat_id,
-            call.message.message_id,
-            "Markdown"
+            call.message.message_id
         )
         return
 
     sql_to_execute = pending["sql"]
     original_user_text = pending["user_text"]
 
-    # ==================================
-    # APPROVE
-    # ==================================
     if action == "approve":
         success, result = execute_query(sql_to_execute, fetch_results=False)
 
@@ -403,17 +606,17 @@ def handle_button_callback(call):
             bot.edit_message_text(
                 "✅ Action completed successfully.",
                 chat_id,
-                call.message.message_id,
+                call.message.message_id
             )
-            
+
             if chat_id not in user_history:
                 user_history[chat_id] = []
-                
-            # LRU CACHE LOGIC: Append -> Slice to max length -> Save
+
+            # Save to LRU cache
             user_history[chat_id].append(f"User: {original_user_text}")
             user_history[chat_id].append(f"Agent: Approved and executed change -> {sql_to_execute}")
             user_history[chat_id] = user_history[chat_id][-MAX_HISTORY_LENGTH:]
-            save_history(user_history)
+            save_json(HISTORY_FILE, user_history)
 
         else:
             bot.edit_message_text(
@@ -422,9 +625,6 @@ def handle_button_callback(call):
                 call.message.message_id
             )
 
-    # ==================================
-    # REJECT
-    # ==================================
     elif action == "reject":
         bot.edit_message_text(
             "❌ Action cancelled by user.",
@@ -432,14 +632,10 @@ def handle_button_callback(call):
             call.message.message_id
         )
 
-    # ==================================
-    # CLEANUP
-    # ==================================
     del pending_queries[query_id]
 
-
 # ==========================================
-# 10. MAIN
+# 11. MAIN
 # ==========================================
 
 if __name__ == "__main__":
