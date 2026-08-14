@@ -20,11 +20,10 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL = os.getenv("model")
+
 # Parse multiple admin IDs from a comma-separated string
 admin_ids_raw = os.getenv("ADMIN_CHAT_IDS", " ")
-
 ADMIN_CHAT_IDS = [int(x.strip()) for x in admin_ids_raw.split(",") if x.strip()]
-
 
 DB_CONFIG = {
     "host": os.getenv("host"),
@@ -47,12 +46,13 @@ DATA_FILE = "bot_data.json"
 MAX_HISTORY_LENGTH = 10 
 DAILY_VIEWER_LIMIT = 5
 
-PRESET_MENU_COMMANDS = [
-    "List customers",
-    "List orders",
-    "Show today's income",
-    "Count total orders"
-]
+# Map buttons directly to hardcoded SQL queries to bypass LLM SQL generation
+PRESET_MENU_COMMANDS = {
+    "List customers": "SELECT id, name, phone_number, mail FROM customers ORDER BY id DESC LIMIT 20;",
+    "List orders": "SELECT id, customer_id, DATE_FORMAT(order_date, '%Y-%m-%d') as order_date, total_amount FROM orders ORDER BY order_date DESC LIMIT 20;",
+    "Show today's income": "SELECT COALESCE(SUM(total_amount), 0) AS todays_income FROM orders WHERE DATE(order_date) = CURDATE();",
+    "Count total orders": "SELECT COUNT(*) AS total_orders FROM orders;"
+}
 
 def load_data():
     if not os.path.exists(DATA_FILE):
@@ -82,7 +82,7 @@ def init_user(chat_id: int):
 
 registration_data = {}
 pending_queries = {}
-# NEW: Tracks auth messages sent to admins so we can delete/edit them later
+# Tracks auth messages sent to admins so we can delete/edit them later
 pending_auth_requests = {} 
 
 # ==========================================
@@ -141,7 +141,38 @@ def summarize_data_with_gemini(data: list, user_request: str, history: str) -> s
     return response.text
 
 # ==========================================
-# 5. DATABASE EXECUTION
+# 5. LOCAL FORMATTER (BYPASS LLM)
+# ==========================================
+
+def format_preset_result(preset_name: str, rows: list) -> str:
+    """Formats the raw database rows into a clean Markdown string locally."""
+    if not rows:
+        return "🔍 No records found."
+        
+    if preset_name == "List customers":
+        msg = "👥 **Recent Customers:**\n\n"
+        for r in rows:
+            msg += f"🔹 **ID:** `{r['id']}` | **{r['name']}**\n📞 `{r['phone_number']}`\n✉️ {r['mail']}\n\n"
+        return msg.strip()
+        
+    elif preset_name == "List orders":
+        msg = "📦 **Recent Orders:**\n\n"
+        for r in rows:
+            msg += f"🔹 **Order ID:** `{r['id']}` | **Customer ID:** `{r['customer_id']}`\n📅 {r['order_date']}\n💰 **${r['total_amount']}**\n\n"
+        return msg.strip()
+        
+    elif preset_name == "Show today's income":
+        income = rows[0].get('todays_income', 0)
+        return f"📈 **Today's Total Income:**\n\n💲 **${income}**"
+        
+    elif preset_name == "Count total orders":
+        total = rows[0].get('total_orders', 0)
+        return f"📊 **Total Orders:**\n\n📦 **{total}** orders placed."
+        
+    return str(rows) # Fallback
+
+# ==========================================
+# 6. DATABASE EXECUTION
 # ==========================================
 
 def execute_query(sql: str, fetch_results: bool = False):
@@ -162,7 +193,7 @@ def execute_query(sql: str, fetch_results: bool = False):
         if connection and connection.is_connected(): connection.close()
 
 # ==========================================
-# 6. ONBOARDING & REGISTRATION FLOW
+# 7. ONBOARDING & REGISTRATION FLOW
 # ==========================================
 
 @bot.message_handler(commands=["start"])
@@ -173,7 +204,7 @@ def start_command(message):
 
     if profile and profile.get("role") in ["admin", "viewer"]:
         markup = telebot_types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-        markup.add(*[telebot_types.KeyboardButton(cmd) for cmd in PRESET_MENU_COMMANDS])
+        markup.add(*[telebot_types.KeyboardButton(cmd) for cmd in PRESET_MENU_COMMANDS.keys()])
         bot.send_message(chat_id, f"👋 Welcome back, {profile['name']}! (Role: **{profile['role'].upper()}**)\n\nUse the quick menu, or send custom queries using `/msg <prompt>`.", parse_mode="Markdown", reply_markup=markup)
     elif profile and profile.get("role") == "pending":
         bot.send_message(chat_id, "⏳ Your access request is currently pending review by the administrator(s).")
@@ -241,7 +272,7 @@ def process_desc_step(message):
                 print(f"Failed to send auth request to Admin {admin_id}: {e}")
 
 # ==========================================
-# 7. HELP & SETTINGS COMMANDS
+# 8. HELP & SETTINGS COMMANDS
 # ==========================================
 
 @bot.message_handler(commands=["help"])
@@ -275,10 +306,10 @@ def settings_menu(message):
     bot.send_message(chat_id, f"🛡 **Governance Settings**\n\nCurrent Status: **{status_text}**", parse_mode="Markdown", reply_markup=keyboard)
 
 # ==========================================
-# 8. DATABASE QUERY PROCESSOR (CORE PIPELINE)
+# 9. DATABASE QUERY PROCESSOR (CORE PIPELINE)
 # ==========================================
 
-def process_database_query(chat_id: int, user_text: str):
+def process_database_query(chat_id: int, user_text: str, is_preset: bool = False):
     user_data = init_user(chat_id)
     profile = user_data.get("profile")
 
@@ -303,8 +334,8 @@ def process_database_query(chat_id: int, user_text: str):
     status_msg = bot.send_message(chat_id, "🧠 Analyzing request...")
 
     try:
-        # 2. RELEVANCE CHECK
-        if not check_message_relevance(user_text):
+        # 2. RELEVANCE CHECK (Bypass for presets)
+        if not is_preset and not check_message_relevance(user_text):
             bot.edit_message_text("⚠️ Please provide a database-related prompt.", chat_id, status_msg.message_id)
             return
 
@@ -314,14 +345,21 @@ def process_database_query(chat_id: int, user_text: str):
             user_data["rate_limit"] = user_usage
             save_data(bot_data)
 
-        # 4. GENERATE SQL
+        # 4. GENERATE OR LOAD SQL
         history_string = "\n".join(user_data["history"])
-        agent_response = get_sql_from_gemini(user_text, history_string)
-        sql = agent_response.sql.strip()
+        
+        if is_preset:
+            sql = PRESET_MENU_COMMANDS[user_text]
+            intent = "READ"
+        else:
+            agent_response = get_sql_from_gemini(user_text, history_string)
+            sql = agent_response.sql.strip()
+            intent = agent_response.intent
+            
         sql_upper = sql.upper()
 
         # 5. RBAC & GOVERNANCE
-        if agent_response.intent == "WRITE" and user_role != "admin":
+        if intent == "WRITE" and user_role != "admin":
             bot.edit_message_text("❌ **Access Denied:** Viewers cannot modify data.", chat_id, status_msg.message_id, parse_mode="Markdown")
             return
 
@@ -329,12 +367,12 @@ def process_database_query(chat_id: int, user_text: str):
             if any(k in sql_upper for k in ["DROP", "TRUNCATE", "ALTER", "GRANT"]) or ";" in sql.rstrip(";"):
                 bot.edit_message_text("❌ Security Alert: Destructive/Multiple queries blocked.", chat_id, status_msg.message_id)
                 return
-            if agent_response.intent == "WRITE" and (sql_upper.startswith("UPDATE") or sql_upper.startswith("DELETE")) and "WHERE" not in sql_upper:
+            if intent == "WRITE" and (sql_upper.startswith("UPDATE") or sql_upper.startswith("DELETE")) and "WHERE" not in sql_upper:
                 bot.edit_message_text("❌ Security Alert: Unbounded UPDATE/DELETE blocked.", chat_id, status_msg.message_id)
                 return
 
         # 6. READ EXECUTION
-        if agent_response.intent == "READ":
+        if intent == "READ":
             bot.edit_message_text("🔍 Fetching data...", chat_id, status_msg.message_id)
             success, result = execute_query(sql, fetch_results=True)
 
@@ -343,7 +381,12 @@ def process_database_query(chat_id: int, user_text: str):
                     bot.edit_message_text("🔍 No matching records found.", chat_id, status_msg.message_id)
                     return
 
-                summary = summarize_data_with_gemini(result, user_text, history_string)
+                # Formatter Bypass: If it's a preset, use the local function
+                if is_preset:
+                    summary = format_preset_result(user_text, result)
+                else:
+                    summary = summarize_data_with_gemini(result, user_text, history_string)
+
                 user_data["history"].extend([f"User: {user_text}", f"Agent: {summary}"])
                 user_data["history"] = user_data["history"][-MAX_HISTORY_LENGTH:]
                 save_data(bot_data)
@@ -356,7 +399,7 @@ def process_database_query(chat_id: int, user_text: str):
                 bot.edit_message_text(f"⚠️ DB Error:\n{result}", chat_id, status_msg.message_id)
 
         # 7. WRITE EXECUTION (HITL)
-        elif agent_response.intent == "WRITE":
+        elif intent == "WRITE":
             query_id = str(uuid.uuid4())[:8]
             pending_queries[query_id] = {"sql": sql, "chat_id": chat_id, "user_text": user_text}
             
@@ -377,16 +420,14 @@ def process_database_query(chat_id: int, user_text: str):
         bot.edit_message_text(user_alert, chat_id, status_msg.message_id, parse_mode="Markdown")
         
         # Broadcast error to ALL admins
-        
         for admin_id in ADMIN_CHAT_IDS:
-                
             try:
                 bot.send_message(int(admin_id), admin_alert, parse_mode="Markdown")
             except Exception:
                 pass
 
 # ==========================================
-# 9. MESSAGE HANDLERS (/msg, preset, commands)
+# 10. MESSAGE HANDLERS (/msg, preset, commands)
 # ==========================================
 
 @bot.message_handler(commands=["msg", "message"])
@@ -395,7 +436,7 @@ def handle_custom_message_command(message):
     if len(parts) < 2 or not parts[1].strip():
         bot.send_message(message.chat.id, "⚠️ **Please provide a prompt.**\nExample: `/msg list orders`", parse_mode="Markdown")
         return
-    process_database_query(message.chat.id, parts[1].strip())
+    process_database_query(message.chat.id, parts[1].strip(), is_preset=False)
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.startswith("/"))
 def handle_unknown_slash_command(message):
@@ -405,12 +446,12 @@ def handle_unknown_slash_command(message):
 def handle_general_text(message):
     text = message.text.strip()
     if text in PRESET_MENU_COMMANDS:
-        process_database_query(message.chat.id, text)
+        process_database_query(message.chat.id, text, is_preset=True)
     else:
         bot.send_message(message.chat.id, f"ℹ️ **Use `/msg` for custom queries.**\nExample: `/msg {text}`", parse_mode="Markdown")
 
 # ==========================================
-# 10. CALLBACK BUTTON HANDLER
+# 11. CALLBACK BUTTON HANDLER
 # ==========================================
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -513,7 +554,7 @@ def handle_button_callback(call):
     del pending_queries[query_id]
 
 # ==========================================
-# 11. MAIN
+# 12. MAIN
 # ==========================================
 if __name__ == "__main__":
     print("🚀 Database Agent is running...")
