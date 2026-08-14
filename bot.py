@@ -215,7 +215,7 @@ def process_desc_step(message):
 
     bot.send_message(chat_id, "✅ *Your request has been submitted!*\nThe administrators have been notified.", parse_mode="Markdown")
 
-    if ADMIN_CHAT_ID:
+    if ADMIN_CHAT_IDS:
         keyboard = telebot_types.InlineKeyboardMarkup()
         keyboard.row(
             telebot_types.InlineKeyboardButton("✅ Approve ADMIN", callback_data=f"auth_admin_{chat_id}"),
