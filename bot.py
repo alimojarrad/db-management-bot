@@ -19,7 +19,12 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+
+# Parse multiple admin IDs from a comma-separated string
+admin_ids_raw = os.getenv("ADMIN_CHAT_IDS", " ")
+
+ADMIN_CHAT_IDS = [int(x.strip()) for x in admin_ids_raw.split(",") if x.strip()]
+
 
 DB_CONFIG = {
     "host": os.getenv("host"),
@@ -62,11 +67,9 @@ def save_data(data_dict):
     with open(DATA_FILE, "w", encoding="utf-8") as file:
         json.dump(data_dict, file, indent=4)
 
-# Load the single unified database
 bot_data = load_data()
 
 def init_user(chat_id: int):
-    """Ensures a user has the base structure in the JSON file."""
     cid = str(chat_id)
     if cid not in bot_data:
         bot_data[cid] = {
@@ -79,6 +82,8 @@ def init_user(chat_id: int):
 
 registration_data = {}
 pending_queries = {}
+# NEW: Tracks auth messages sent to admins so we can delete/edit them later
+pending_auth_requests = {} 
 
 # ==========================================
 # 3. INITIALIZE CLIENTS
@@ -171,7 +176,7 @@ def start_command(message):
         markup.add(*[telebot_types.KeyboardButton(cmd) for cmd in PRESET_MENU_COMMANDS])
         bot.send_message(chat_id, f"👋 Welcome back, {profile['name']}! (Role: **{profile['role'].upper()}**)\n\nUse the quick menu, or send custom queries using `/msg <prompt>`.", parse_mode="Markdown", reply_markup=markup)
     elif profile and profile.get("role") == "pending":
-        bot.send_message(chat_id, "⏳ Your access request is currently pending review by the administrator.")
+        bot.send_message(chat_id, "⏳ Your access request is currently pending review by the administrator(s).")
     else:
         msg = bot.send_message(chat_id, "👋 Welcome!\nYou are not authorized yet. Please fill out this short form.\n\n👤 *What is your full name?*", parse_mode="Markdown", reply_markup=telebot_types.ReplyKeyboardRemove())
         bot.register_next_step_handler(msg, process_name_step)
@@ -208,7 +213,7 @@ def process_desc_step(message):
     }
     save_data(bot_data)
 
-    bot.send_message(chat_id, "✅ *Your request has been submitted!*\nThe administrator has been notified.", parse_mode="Markdown")
+    bot.send_message(chat_id, "✅ *Your request has been submitted!*\nThe administrators have been notified.", parse_mode="Markdown")
 
     if ADMIN_CHAT_ID:
         keyboard = telebot_types.InlineKeyboardMarkup()
@@ -224,7 +229,16 @@ def process_desc_step(message):
             f"🎭 **Requested:** {user_data['profile']['wanted_role']}\n"
             f"📝 **Reason:** {user_data['profile']['desc']}\n"
         )
-        bot.send_message(int(ADMIN_CHAT_ID), admin_msg, parse_mode="Markdown", reply_markup=keyboard)
+        
+        # Keep track of message IDs for each admin
+        pending_auth_requests[chat_id] = []
+        
+        for admin_id in ADMIN_CHAT_IDS:
+            try:
+                sent_msg = bot.send_message(admin_id, admin_msg, parse_mode="Markdown", reply_markup=keyboard)
+                pending_auth_requests[chat_id].append({"admin_id": admin_id, "message_id": sent_msg.message_id})
+            except Exception as e:
+                print(f"Failed to send auth request to Admin {admin_id}: {e}")
 
 # ==========================================
 # 7. HELP & SETTINGS COMMANDS
@@ -350,25 +364,26 @@ def process_database_query(chat_id: int, user_text: str):
             kb.row(telebot_types.InlineKeyboardButton("✅ Approve", callback_data=f"approve_{query_id}"), telebot_types.InlineKeyboardButton("❌ Reject", callback_data=f"reject_{query_id}"))
             bot.edit_message_text(f"⚠️ Action Required\n\n{agent_response.explanation}\n\nApprove change?", chat_id, status_msg.message_id, reply_markup=kb)
 
-    # ----------------------------------------------------
-    # NEW: CENTRALIZED ERROR HANDLING & ALERT ROUTING
-    # ----------------------------------------------------
     except Exception as e:
         error_str = str(e)
         
-        # Check if the error is due to hitting Gemini's rate limits
         if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "Quota exceeded" in error_str:
             user_alert = "🛠 **Server Under Maintenance**\n\nOur systems are currently experiencing high traffic. Please try again in a few minutes."
             admin_alert = f"🚨 **API Quota Exceeded (429)** 🚨\n\nUser `{chat_id}` attempted a query but the Gemini API limit was reached.\n\n*Error Trace:*\n`{error_str[:3000]}`"
         else:
-            # Catch-all for any other weird bugs or crashes
             user_alert = "❌ **An unexpected error occurred.**\n\nThe server is under maintenance or encountered a bug. The system administrator has been notified."
             admin_alert = f"🚨 **System Error** 🚨\n\nUser `{chat_id}` encountered an error.\n\n*Error Trace:*\n`{error_str[:3000]}`"
         
-        # Send safe message to the user
         bot.edit_message_text(user_alert, chat_id, status_msg.message_id, parse_mode="Markdown")
-        # Send detailed alert to the admin
-        bot.send_message(int(ADMIN_CHAT_ID), admin_alert, parse_mode="Markdown")
+        
+        # Broadcast error to ALL admins
+        
+        for admin_id in ADMIN_CHAT_IDS:
+                
+            try:
+                bot.send_message(int(admin_id), admin_alert, parse_mode="Markdown")
+            except Exception:
+                pass
 
 # ==========================================
 # 9. MESSAGE HANDLERS (/msg, preset, commands)
@@ -402,8 +417,10 @@ def handle_general_text(message):
 def handle_button_callback(call):
     bot.answer_callback_query(call.id)
     chat_id = call.message.chat.id
+    cid = str(chat_id)
     data = call.data
 
+    # --- Governance Toggle ---
     if data == "toggle_gov":
         user_data = init_user(chat_id)
         new_state = not user_data["governance_enabled"]
@@ -415,26 +432,61 @@ def handle_button_callback(call):
         bot.edit_message_text(f"🛡 **Governance Settings**\n\nCurrent Status: **{'🟢 ENABLED' if new_state else '🔴 DISABLED'}**", chat_id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
         return
 
+    # --- User Access Approvals (Multi-Admin) ---
     if data.startswith("auth_"):
         parts = data.split("_")
-        action, target_user_id = parts[1], str(parts[2])
+        action = parts[1]
+        target_user_id = parts[2]
+        target_user_id_int = int(target_user_id)
+        admin_name = call.from_user.first_name
 
-        if target_user_id in bot_data and bot_data[target_user_id]["profile"]:
-            if action == "admin":
-                bot_data[target_user_id]["profile"]["role"] = "admin"
-                bot.edit_message_text(f"✅ Approved as ADMIN.", chat_id, call.message.message_id)
-                bot.send_message(target_user_id, "🎉 You are now an **ADMIN**! Type /start", parse_mode="Markdown")
-            elif action == "viewer":
-                bot_data[target_user_id]["profile"]["role"] = "viewer"
-                bot.edit_message_text(f"✅ Approved as VIEWER.", chat_id, call.message.message_id)
-                bot.send_message(target_user_id, "🎉 You are now a **VIEWER**! Type /start", parse_mode="Markdown")
-            elif action == "reject":
-                bot_data[target_user_id]["profile"] = None
-                bot.edit_message_text(f"❌ Rejected.", chat_id, call.message.message_id)
-                bot.send_message(target_user_id, "❌ Access declined.")
-            save_data(bot_data)
+        user_data = bot_data.get(target_user_id)
+        
+        # Check if another admin already handled this
+        if not user_data or not user_data.get("profile") or user_data["profile"].get("role") != "pending":
+            bot.edit_message_text("⚠️ This request has already been handled by another administrator.", chat_id, call.message.message_id)
+            return
+
+        # Process the role assignment
+        status_text = ""
+        notification_text = ""
+        
+        if action == "admin":
+            bot_data[target_user_id]["profile"]["role"] = "admin"
+            status_text = f"✅ Approved as **ADMIN** by {admin_name}."
+            notification_text = "🎉 You are now an **ADMIN**! Type /start"
+        elif action == "viewer":
+            bot_data[target_user_id]["profile"]["role"] = "viewer"
+            status_text = f"✅ Approved as **VIEWER** by {admin_name}."
+            notification_text = "🎉 You are now a **VIEWER**! Type /start"
+        elif action == "reject":
+            bot_data[target_user_id]["profile"] = None
+            status_text = f"❌ Rejected by {admin_name}."
+            notification_text = "❌ Access declined."
+            
+        save_data(bot_data)
+        bot.send_message(target_user_id_int, notification_text, parse_mode="Markdown")
+        
+        # Update messages for ALL admins to remove buttons and show who handled it
+        auth_msgs = pending_auth_requests.get(target_user_id_int, [])
+        for a_msg in auth_msgs:
+            a_id = a_msg["admin_id"]
+            m_id = a_msg["message_id"]
+            try:
+                if a_id == chat_id:
+                    bot.edit_message_text(status_text, a_id, m_id, parse_mode="Markdown")
+                else:
+                    bot.edit_message_text(f"🔒 *Request Resolved*\nThis request was handled by {admin_name}.", a_id, m_id, parse_mode="Markdown")
+            except Exception:
+                pass # Message might have been deleted manually by the admin
+                
+        # Clean up memory
+        if target_user_id_int in pending_auth_requests:
+            del pending_auth_requests[target_user_id_int]
+            
         return
 
+    # --- SQL Write Approvals ---
     try:
         action, query_id = data.split("_", 1)
     except ValueError:
