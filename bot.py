@@ -367,12 +367,8 @@ def process_database_query(chat_id: int, user_text: str):
         
         # Send safe message to the user
         bot.edit_message_text(user_alert, chat_id, status_msg.message_id, parse_mode="Markdown")
-        
-        # Send ugly stack trace to the Admin
-        if ADMIN_CHAT_ID:
-            # Prevent double-messaging if the admin is the one who triggered the error
-            if str(chat_id) != str(ADMIN_CHAT_ID):
-                bot.send_message(int(ADMIN_CHAT_ID), admin_alert, parse_mode="Markdown")
+        # Send detailed alert to the admin
+        bot.send_message(int(ADMIN_CHAT_ID), admin_alert, parse_mode="Markdown")
 
 # ==========================================
 # 9. MESSAGE HANDLERS (/msg, preset, commands)
