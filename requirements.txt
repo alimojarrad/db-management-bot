@@ -1,0 +1,5 @@
+mysql-connector-python
+google-genai
+pydantic
+pyTelegramBotAPI
+python-dotenv
